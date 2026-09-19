@@ -272,6 +272,187 @@ def test_conflict_on_clamped_overlap_still_detected():
     assert result == {"status": "conflict", "first_conflict_offset": 10}
 
 
+# ---------- 首尾嵌套 ----------
+
+
+def test_last_fragment_fully_nested_inside_earlier_one():
+    # 末片 [16,20) 完全嵌套在非末片 [8,40) 的尾部；越出锚点的 [20,40)
+    # 部分须裁剪，非末片长度 32 仍按 8 对齐
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(2, False, b"qrst"),
+            frag(1, True, b"ijklmnop" + b"qrst" + b"X" * 20),
+            frag(0, True, b"abcdefgh"),
+        ],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [2, 1, 0]
+    assert base64.b64decode(result["payload"]) == b"abcdefghijklmnopqrst"
+
+
+def test_last_fragment_nested_identical_duplicate_accepted():
+    # 末片 [8,16) 被完全相同的非末片 [8,16) 覆盖包裹，另有 8 对齐大片
+    # [0,24) 越过锚点 [16,24)
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(0, True, b"abcdefghijklmnop" + b"X" * 8),
+            frag(1, True, b"ijklmnop"),
+            frag(1, False, b"ijklmnop"),
+        ],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [0, 1, 2]
+    assert base64.b64decode(result["payload"]) == b"abcdefghijklmnop"
+
+
+def test_first_fragment_nested_inside_later_one():
+    # 首片 [0,8) 完全嵌套在后续 8 对齐片 [0,24) 的头部，末片锚定 28
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(3, False, b"yzAB"),
+            frag(0, True, b"abcdefgh"),
+            frag(0, True, b"abcdefghijklmnopqrstuvwx"),
+        ],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [1, 2, 0]
+    assert base64.b64decode(result["payload"]) == b"abcdefghijklmnopqrstuvwxyzAB"
+
+
+def test_nested_conflict_reports_inner_offset_regardless_of_order():
+    # 末片 [8,16) 与 8 对齐包裹片 [0,24) 在绝对偏移 9 处冲突；
+    # 两种输入顺序结果一致
+    payloads = [
+        frag(0, True, b"abcdefgh" + b"iXklmnop" + b"X" * 8),
+        frag(1, False, b"ijklmnop"),
+    ]
+    for order in (payloads, list(reversed(payloads))):
+        result = reassemble_ipv4(20, order)
+        assert result == {"status": "conflict", "first_conflict_offset": 9}
+
+
+# ---------- 多片交叉重叠 ----------
+
+
+def test_three_fragments_crossing_overlap_identical():
+    # [0,24)、[8,32)、[16,40) 三片两两交叉；末片锚定 40
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(2, True, bytes(range(16, 40))),
+            frag(0, True, bytes(range(0, 24))),
+            frag(4, False, bytes(range(32, 40))),
+            frag(1, True, bytes(range(8, 32))),
+        ],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [1, 3, 0, 2]
+    assert base64.b64decode(result["payload"]) == bytes(range(40))
+
+
+def test_three_fragments_crossing_overlap_first_conflict_offset():
+    # [0,24) 与 [8,32) 共享 [8,24)；[16,40) 与两者共享 [16,24)，
+    # 与 [8,32) 共享 [24,32)。冲突：[0,24) 在偏移 20 处为 \x14 而
+    # [16,40) 为 \xff，故首个冲突为 20；另在偏移 28 放置冲突（30>20）
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(2, True,
+                 bytes(range(16, 20)) + b"\xff" + bytes(range(21, 28))
+                 + b"\x00" + bytes(range(29, 40))),
+            frag(0, True, bytes(range(0, 24))),
+            frag(4, False, bytes(range(32, 40))),
+            frag(1, True, bytes(range(8, 32))),
+        ],
+    )
+    assert result == {"status": "conflict", "first_conflict_offset": 20}
+
+
+def test_many_fragments_same_span_conflict_min_offset():
+    # 4 个分片覆盖同一区间 [0,16)，分别在不同字节冲突；返回最小偏移，
+    # 与输入顺序无关
+    def variant(bad_pos, bad_byte):
+        data = bytearray(b"\x00" * 16)
+        data[bad_pos] = bad_byte
+        return bytes(data)
+
+    shuffled = [
+        frag(0, True, variant(13, 0x11)),
+        frag(0, True, variant(3, 0x22)),
+        frag(0, True, variant(7, 0x33)),
+        frag(2, False, b"\x00" * 8),
+        frag(0, True, b"\x00" * 16),
+    ]
+    for order in (shuffled, list(reversed(shuffled))):
+        result = reassemble_ipv4(20, order)
+        assert result == {"status": "conflict", "first_conflict_offset": 3}
+
+
+# ---------- 末片锚点外数据 ----------
+
+
+def test_multiple_fragments_beyond_anchor_clamped():
+    # 末片锚定总长 8；index 1 部分越界 [0,16)→仅 [0,8)，index 2 完全越界
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(2, True, b"zzzzzzzz"),          # 完全越界 [16,24)
+            frag(0, True, b"abcdefghXXXXXXXX"),  # 部分越界 [0,16)
+            frag(0, False, b"abcdefgh"),
+        ],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [1, 2]
+    assert base64.b64decode(result["payload"]) == b"abcdefgh"
+
+
+def test_data_beyond_anchor_never_compared_even_if_different():
+    # 越出锚点 [8,16) 的两片字节即使不同也不报冲突；锚点内一致即完成
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(0, False, b"abcdefgh"),
+            frag(0, True, b"abcdefghXXXXXXXX"),
+            frag(0, True, b"abcdefghYYYYYYYY"),
+        ],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [0, 1, 2]
+
+
+def test_conflict_inside_anchor_takes_precedence_over_garbage_outside():
+    # 锚点内在偏移 5 冲突，锚点外 [8,16) 两片内容随意
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(0, False, b"abcdeXgh"),
+            frag(0, True, b"abcdefghZZZZZZZZ"),
+            frag(0, True, b"abcdefghQQQQQQQQ"),
+        ],
+    )
+    assert result == {"status": "conflict", "first_conflict_offset": 5}
+
+
+def test_empty_anchor_with_all_data_beyond_is_complete_empty():
+    # 零长度末片锚定空数据报；所有非末片数据全在锚点外，不贡献
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(1, True, b"XXXXXXXX"),
+            frag(0, True, b"YYYYYYYY"),
+            frag(0, False, b""),
+        ],
+    )
+    assert result == {
+        "status": "complete",
+        "contributing_fragments": [],
+        "payload": "",
+    }
+
+
 # ---------- 422 类输入错误 ----------
 
 
@@ -463,3 +644,166 @@ def test_random_gap_property():
         }
         expected = set(range(pieces[drop][0], pieces[drop][0] + pieces[drop][1]))
         assert missing_set == expected
+
+
+# ---------- 差分模糊：区间内核 vs 独立逐字节参考实现 ----------
+
+
+def _reference_reassemble(header_length, fragments):
+    """与产品代码独立的逐字节参考实现（旧 owner 列表语义）。"""
+    parsed = []
+    for index, (raw_offset, more_fragments, payload) in enumerate(fragments):
+        parsed.append(
+            (raw_offset * OFFSET_UNIT, bool(more_fragments), payload, index)
+        )
+    last_indexes = [index for _s, more, _p, index in parsed if not more]
+    assert len(last_indexes) == 1
+    for start, more, payload, index in parsed:
+        if more and len(payload) % OFFSET_UNIT != 0:
+            raise ReassemblyInputError("non_aligned_fragment")
+    last_start, _more, last_payload, _idx = parsed[last_indexes[0]]
+    total_length = last_start + len(last_payload)
+    assert header_length + total_length <= IPV4_DATAGRAM_MAX
+
+    buffer = bytearray(total_length)
+    owner = [None] * total_length
+    first_conflict = None
+    for start, _more, payload, index in parsed:
+        if start >= total_length:
+            continue
+        for rel, byte in enumerate(payload):
+            pos = start + rel
+            if pos >= total_length:
+                break
+            if owner[pos] is None:
+                owner[pos] = index
+                buffer[pos] = byte
+            elif buffer[pos] != byte and (
+                first_conflict is None or pos < first_conflict
+            ):
+                first_conflict = pos
+    if first_conflict is not None:
+        return {"status": "conflict", "first_conflict_offset": first_conflict}
+
+    covered = [False] * total_length
+    for start, _more, payload, _index in parsed:
+        for pos in range(start, min(start + len(payload), total_length)):
+            covered[pos] = True
+    missing = []
+    gap_start = None
+    for pos in range(total_length):
+        if not covered[pos] and gap_start is None:
+            gap_start = pos
+        if covered[pos] and gap_start is not None:
+            missing.append([gap_start, pos])
+            gap_start = None
+    if gap_start is not None:
+        missing.append([gap_start, total_length])
+    if missing:
+        return {"status": "incomplete", "missing_ranges": missing}
+
+    contributing = sorted(
+        {
+            index
+            for start, _more, payload, index in parsed
+            if start < total_length
+            and min(start + len(payload), total_length) > start
+        },
+        key=lambda idx: (next(s for s, _m, _p, i in parsed if i == idx), idx),
+    )
+    return {
+        "status": "complete",
+        "contributing_fragments": contributing,
+        "payload": b64(bytes(buffer)),
+    }
+
+
+def test_differential_fuzz_against_bytewise_reference():
+    import random
+
+    rng = random.Random(20240919)
+    for trial in range(400):
+        n = rng.randint(0, 96)
+        data = bytes(rng.randrange(256) for _ in range(n))
+
+        # 末片起点必须 8 对齐（片偏移字段语义）；末片载荷可不对齐
+        anchor = 8 * rng.randint(0, n // 8)
+        fragments = []
+
+        # [0, anchor) 内的标准 8 字节非末片：随机丢弃制造缺口，
+        # 随机改字节制造冲突
+        for start in range(0, anchor, 8):
+            if rng.random() < 0.2:
+                continue
+            payload = bytearray(data[start:start + 8])
+            for _ in range(rng.randint(0, 2)):
+                payload[rng.randrange(8)] = rng.randrange(256)
+            fragments.append([start // 8, True, bytes(payload)])
+
+        # 随机追加：重发片、跨越锚点片、完全越界片（均为 8 对齐非末片）
+        for _ in range(rng.randint(0, 3)):
+            kind = rng.randrange(3)
+            if kind == 0 and anchor > 0:
+                src_start = 8 * rng.randrange(anchor // 8)
+                dup = bytearray(data[src_start:src_start + 8])
+                if dup and rng.random() < 0.5:
+                    dup[rng.randrange(8)] = rng.randrange(256)
+                fragments.append([src_start // 8, True, bytes(dup)])
+            elif kind == 1 and anchor > 0:
+                src_start = 8 * rng.randrange(anchor // 8)
+                length = 8 * rng.randint(1, 4)
+                crossing = bytearray(
+                    rng.randrange(256) for _ in range(length)
+                )
+                # 前半段通常与真值一致，随机污染
+                shared = min(length, n - src_start)
+                if shared > 0:
+                    crossing[:shared] = data[src_start:src_start + shared]
+                for _ in range(rng.randint(0, 2)):
+                    crossing[rng.randrange(length)] = rng.randrange(256)
+                fragments.append([src_start // 8, True, bytes(crossing)])
+            else:
+                fragments.append([
+                    (n + 8) // 8 + rng.randint(0, 3),
+                    True,
+                    bytes(rng.randrange(256) for _ in range(8)),
+                ])
+
+        # 唯一末片锚定 [anchor, n)；可能被污染制造尾部冲突
+        last_payload = bytearray(data[anchor:n])
+        if last_payload and rng.random() < 0.3:
+            last_payload[rng.randrange(len(last_payload))] = rng.randrange(256)
+        fragments.append([anchor // 8, False, bytes(last_payload)])
+
+        rng.shuffle(fragments)
+        tuples = [(off, more, payload) for off, more, payload in fragments]
+        expected = _reference_reassemble(20, tuples)
+        actual = reassemble_ipv4(20, tuples)
+        assert actual == expected, (
+            f"trial {trial} mismatch\nfragments={tuples!r}\n"
+            f"expected={expected!r}\nactual={actual!r}"
+        )
+
+
+def test_differential_fuzz_order_independence():
+    import random
+
+    rng = random.Random(987654321)
+    for _ in range(100):
+        n = rng.randint(8, 80)
+        data = bytes(rng.randrange(256) for _ in range(n))
+        fragments = []
+        starts = list(range(0, n, 8))
+        for piece_index, start in enumerate(starts):
+            payload = bytearray(data[start:min(start + 8, n)])
+            if rng.random() < 0.3 and payload:
+                payload[rng.randrange(len(payload))] ^= 0xFF
+            fragments.append(
+                (start // 8, piece_index != len(starts) - 1, bytes(payload))
+            )
+        rng.shuffle(fragments)
+        assert reassemble_ipv4(20, fragments) == _reference_reassemble(
+            20, fragments
+        )
+
+

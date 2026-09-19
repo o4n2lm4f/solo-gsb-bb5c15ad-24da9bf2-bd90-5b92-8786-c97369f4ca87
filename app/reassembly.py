@@ -23,11 +23,18 @@
    合并后的缺失半开区间；覆盖完整时返回 ``complete``、按偏移排序的
    **贡献分片索引**（至少贡献一个总载荷字节的输入分片序号）与重组后的
    Base64 载荷。
+
+实现上先把每个分片裁剪成锚点内的半开字节区间，再对按起点排序的区间做
+**扫描线**：在覆盖集不变的每个段内只做切片级比较（C 层 memcmp / memcpy，
+二分定位段内首个不一致偏移），既不为每个分片逐字节遍历，也不构造与总载荷
+等长的 owner 列表；段按偏移升序产出，故任意输入顺序下都能直接得到全局
+最小冲突偏移，且冲突判定先于缺口计算。
 """
 from __future__ import annotations
 
 import base64
 import binascii
+from bisect import insort
 from typing import Sequence
 
 from .analyzer import merge_intervals, subtract_covered
@@ -212,44 +219,76 @@ def reassemble_ipv4(
             limit=IPV4_DATAGRAM_MAX,
         )
 
-    # 按字节重组：owner[pos] 为首个写入该字节的分片序号；重复且字节一致的
-    # 覆盖允许，字节冲突时记录全部分片中最小的不一致偏移（越出末片锚定总
-    # 长度的字节不参与数据报重组）。
-    buffer = bytearray(total_length)
-    owner: list[int | None] = [None] * total_length
-    first_conflict: int | None = None
+    # 区间化：将每个分片裁剪为半开字节区间 [start, end) 与对应载荷
+    # （越出末片锚定总长度的部分不参与数据报重组）。零长度 / 完全越界的
+    # 分片保留在 parsed 中用于错误校验，但不产生 span。后续只对载荷做
+    # **切片级**比较（C 层 memcmp；CPython 的 memoryview 相等比较反而走
+    # 通用迭代路径，故这里保留 bytes 切片）。
+    spans: list[tuple[int, int, int, bytes]] = []
     for fragment in parsed:
         start = fragment["offset_bytes"]
-        if start >= total_length:
-            continue
-        for rel, byte in enumerate(fragment["payload"]):
-            pos = start + rel
-            if pos >= total_length:
+        end = min(start + len(fragment["payload"]), total_length)
+        if start < end:
+            spans.append((start, end, fragment["index"], fragment["payload"]))
+
+    # 重叠冲突检测：按区间起点做扫描线。每个非平凡常量覆盖段 [lo, hi) 内，
+    # 覆盖该段的分片集合不变；任取一个代表片，其余分片只需与代表片做
+    # **切片级**比较（C 层 memcmp，不逐字节遍历）。段按偏移升序产生，首个
+    # 含冲突的段即给出全局最小冲突偏移，与分片输入顺序无关。
+    events: list[tuple[int, int, int]] = []
+    for event_order, (start, end, _index, _payload) in enumerate(spans):
+        events.append((start, 1, event_order))  # 起点：加入活动集
+        events.append((end, 0, event_order))    # 终点：移出活动集
+    events.sort()
+
+    first_conflict: int | None = None
+    active: list[int] = []  # 活动 span 在 spans 中的序号，按输入序号有序
+    prev = 0
+    event_idx = 0
+    while event_idx < len(events):
+        position = events[event_idx][0]
+        lo, hi = prev, position
+        if lo < hi and len(active) > 1:
+            rep = min(active, key=lambda span_idx: spans[span_idx][2])
+            rep_start, _rep_end, _rep_index, rep_payload = spans[rep]
+            rep_seg = rep_payload[lo - rep_start:hi - rep_start]
+            segment_conflict: int | None = None
+            for span_idx in active:
+                span_start, _span_end, _index, payload = spans[span_idx]
+                segment = payload[lo - span_start:hi - span_start]
+                if segment == rep_seg:
+                    continue
+                # 二分定位本片与代表片在该段内首个不一致字节：等长前缀在
+                # 长度 0..d 上一致（d 为段内首个不一致相对偏移），故最小不
+                # 一致前缀长度 lo_len = d+1；仅 O(log n) 次切片比较。
+                lo_len, hi_len = 0, len(rep_seg)
+                while lo_len < hi_len:
+                    mid = (lo_len + hi_len) // 2
+                    if segment[:mid] == rep_seg[:mid]:
+                        lo_len = mid + 1
+                    else:
+                        hi_len = mid
+                candidate = lo + lo_len - 1
+                if segment_conflict is None or candidate < segment_conflict:
+                    segment_conflict = candidate
+            if segment_conflict is not None:
+                first_conflict = segment_conflict
                 break
-            existing = owner[pos]
-            if existing is None:
-                owner[pos] = fragment["index"]
-                buffer[pos] = byte
-            elif buffer[pos] != byte and (
-                first_conflict is None or pos < first_conflict
-            ):
-                first_conflict = pos
+        # 应用该位置上的全部事件（同位置先移出后加入，不影响下一段活动集）
+        while event_idx < len(events) and events[event_idx][0] == position:
+            _pos, kind, ev_order = events[event_idx]
+            if kind == 1:
+                insort(active, ev_order)
+            else:
+                active.remove(ev_order)
+            event_idx += 1
+        prev = position
 
     if first_conflict is not None:
         return {"status": CONFLICT, "first_conflict_offset": first_conflict}
 
-    # 已覆盖区间（半开）归并后求其在 [0, total_length) 内的补集
-    def clamped_end(fragment: dict) -> int:
-        return min(
-            fragment["offset_bytes"] + len(fragment["payload"]), total_length
-        )
-
-    filled = [
-        (fragment["offset_bytes"], clamped_end(fragment) - 1)
-        for fragment in parsed
-        if fragment["offset_bytes"] < total_length
-        and clamped_end(fragment) > fragment["offset_bytes"]
-    ]
+    # 已覆盖区间（闭区间）归并后求其在 [0, total_length) 内的补集
+    filled = [(start, end - 1) for start, end, _index, _payload in spans]
     missing_closed = (
         subtract_covered((0, total_length - 1), merge_intervals(filled))
         if total_length
@@ -259,15 +298,17 @@ def reassemble_ipv4(
     if missing_ranges:
         return {"status": INCOMPLETE, "missing_ranges": missing_ranges}
 
+    # 覆盖完整且无冲突：重叠处字节必然一致，按 (偏移, 输入序号) 序以切片
+    # 写入重组缓冲（C 层 memcpy，不逐字节拷贝）；仅写入落在锚定长度内的片。
     contributing = sorted(
-        {
-            fragment["index"]
-            for fragment in parsed
-            if fragment["offset_bytes"] < total_length
-            and clamped_end(fragment) > fragment["offset_bytes"]
-        },
+        {index for _start, _end, index, _payload in spans},
         key=lambda index: (parsed[index]["offset_bytes"], index),
     )
+    buffer = bytearray(total_length)
+    for start, end, _index, payload in sorted(
+        spans, key=lambda span: (span[0], span[2])
+    ):
+        buffer[start:end] = payload[: end - start]
     return {
         "status": COMPLETE,
         "contributing_fragments": contributing,
