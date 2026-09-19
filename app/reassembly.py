@@ -16,9 +16,12 @@
 3. **数据报上限**：总载荷长度加首部长度不能越过 IPv4 数据报 65535 字节
    上限。
 4. **按字节区间重组**：每个分片占据半开字节区间
-   ``[offset*8, offset*8 + len(payload))``。重叠覆盖处字节必须一致，
-   重复且字节一致的覆盖可接受；任一重叠字节冲突即报 ``conflict`` 与
-   **首个冲突偏移**（全部分片中最小的不一致字节偏移），优先于缺口结论。
+   ``[offset*8, offset*8 + len(payload))``。将各片裁剪到末片锚定的
+   ``[0, 总载荷长度)`` 后按区间排序，用事件扫描 + 区间/切片运算检测
+   重叠，既不为每个分片逐字节遍历，也不建立与总载荷等长的 owner 表。
+   重叠覆盖处字节必须一致，重复且字节一致的覆盖可接受；任一重叠字节
+   冲突即报 ``conflict`` 与**首个冲突偏移**（全部分片中最小的不一致字节
+   偏移，与输入顺序无关），优先于缺口结论。
 5. 无冲突但相对 ``[0, 总载荷长度)`` 存在缺口时返回 ``incomplete`` 与
    合并后的缺失半开区间；覆盖完整时返回 ``complete``、按偏移排序的
    **贡献分片索引**（至少贡献一个总载荷字节的输入分片序号）与重组后的
@@ -154,6 +157,108 @@ def _validate_common(
     return header_length, parsed
 
 
+def _clamped_fragments(parsed: list[dict], total_length: int) -> list[dict]:
+    """把各分片裁剪到末片锚定的 ``[0, total_length)`` 半开区间。
+
+    返回按 ``(起点, 输入序号)`` 升序、仅含至少一个锚定字节的分片列表；
+    每项为 ``{"index", "start", "end", "slice"}``，``slice`` 是该片落在
+    锚定区间内的载荷视图（零拷贝 memoryview），空载荷与完全越界片丢弃。
+    """
+    items: list[dict] = []
+    for fragment in parsed:
+        start = fragment["offset_bytes"]
+        if start >= total_length:
+            continue  # 整片落在锚点之外
+        end = min(start + len(fragment["payload"]), total_length)
+        if end <= start:
+            continue  # 空载荷片不贡献任何字节
+        items.append(
+            {
+                "index": fragment["index"],
+                "start": start,
+                "end": end,
+                "slice": memoryview(fragment["payload"])[: end - start],
+            }
+        )
+    items.sort(key=lambda item: (item["start"], item["index"]))
+    return items
+
+
+def _first_mismatch(left: memoryview, right: memoryview) -> int | None:
+    """两段等长字节的首个不一致相对偏移；完全一致时返回 ``None``。
+
+    用整体切片比较 + 二分定位，避免逐字节 Python 循环：一致时只有一次
+    原生 memcmp；不一致时二分，复制量不超过 ``2 × len``。
+    """
+    length = len(left)
+    if length == 0 or left == right:
+        return None
+    lo, hi = 0, length
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if left[lo:mid] == right[lo:mid]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _first_conflict_offset(items: list[dict]) -> int | None:
+    """以区间事件扫描求全部分片间最小的不一致字节偏移。
+
+    按起点排序后，用 ``(position, kind, index)`` 事件维护当前活跃分片集合
+    （同位置先出后入——半开区间端点相接不算重叠），逐段扫描活跃集不变的
+    原子段。任一段内：与该段**输入序号最小**分片（即原逐字节 owner 语义
+    下的写入方）逐对比较载荷切片；若第三方与写入方一致则二者一致，若冲突
+    则必与写入方冲突，故只对写入方比较即可覆盖所有分片对。原子段按位置
+    升序处理，当前段得到的最小不一致就是全局最小值（与输入顺序无关）。
+    """
+    by_index = {item["index"]: item for item in items}
+    events: list[tuple[int, int, int]] = []
+    for item in items:
+        events.append((item["end"], 0, item["index"]))    # 出事件
+        events.append((item["start"], 1, item["index"]))  # 入事件
+    events.sort()
+
+    active: dict[int, dict] = {}
+    cursor: int | None = None
+    ei = 0
+    n_events = len(events)
+    while ei < n_events:
+        position = events[ei][0]
+        # 处理 [cursor, position) 这一活跃集不变的原子段
+        if cursor is not None and position > cursor and active:
+            ref_index = min(active)
+            reference = active[ref_index]
+            rel = cursor - reference["start"]
+            span = position - cursor
+            segment_min: int | None = None
+            for item in active.values():
+                if item["index"] == ref_index:
+                    continue
+                other_rel = cursor - item["start"]
+                mismatch = _first_mismatch(
+                    item["slice"][other_rel:other_rel + span],
+                    reference["slice"][rel:rel + span],
+                )
+                if mismatch is not None:
+                    offset = cursor + mismatch
+                    if segment_min is None or offset < segment_min:
+                        segment_min = offset
+            if segment_min is not None:
+                return segment_min  # 更早的段已确认无冲突，此即全局最小
+        # 应用该位置的全部事件（半开区间：先出后入，端点相接不算重叠）
+        cursor = position
+        while ei < n_events and events[ei][0] == position:
+            _, kind, index = events[ei]
+            if kind == 0:
+                del active[index]
+            else:
+                active[index] = by_index[index]
+            ei += 1
+    return None
+
+
 def reassemble_ipv4(
     header_length: object,
     fragments: Sequence[tuple[object, object, object]],
@@ -212,44 +317,17 @@ def reassemble_ipv4(
             limit=IPV4_DATAGRAM_MAX,
         )
 
-    # 按字节重组：owner[pos] 为首个写入该字节的分片序号；重复且字节一致的
-    # 覆盖允许，字节冲突时记录全部分片中最小的不一致偏移（越出末片锚定总
-    # 长度的字节不参与数据报重组）。
-    buffer = bytearray(total_length)
-    owner: list[int | None] = [None] * total_length
-    first_conflict: int | None = None
-    for fragment in parsed:
-        start = fragment["offset_bytes"]
-        if start >= total_length:
-            continue
-        for rel, byte in enumerate(fragment["payload"]):
-            pos = start + rel
-            if pos >= total_length:
-                break
-            existing = owner[pos]
-            if existing is None:
-                owner[pos] = fragment["index"]
-                buffer[pos] = byte
-            elif buffer[pos] != byte and (
-                first_conflict is None or pos < first_conflict
-            ):
-                first_conflict = pos
+    # 将各片裁剪到末片锚定的 [0, total_length)（越界部分不参与数据报
+    # 重组），并按 (起点, 输入序号) 排序；后续全部基于区间/切片运算。
+    items = _clamped_fragments(parsed, total_length)
 
+    # 冲突优先于缺口：事件扫描所有重叠原子段，按切片比较求全局最小冲突偏移
+    first_conflict = _first_conflict_offset(items)
     if first_conflict is not None:
         return {"status": CONFLICT, "first_conflict_offset": first_conflict}
 
-    # 已覆盖区间（半开）归并后求其在 [0, total_length) 内的补集
-    def clamped_end(fragment: dict) -> int:
-        return min(
-            fragment["offset_bytes"] + len(fragment["payload"]), total_length
-        )
-
-    filled = [
-        (fragment["offset_bytes"], clamped_end(fragment) - 1)
-        for fragment in parsed
-        if fragment["offset_bytes"] < total_length
-        and clamped_end(fragment) > fragment["offset_bytes"]
-    ]
+    # 已覆盖区间（闭区间表示）归并后求其在 [0, total_length) 内的补集
+    filled = [(item["start"], item["end"] - 1) for item in items]
     missing_closed = (
         subtract_covered((0, total_length - 1), merge_intervals(filled))
         if total_length
@@ -259,17 +337,14 @@ def reassemble_ipv4(
     if missing_ranges:
         return {"status": INCOMPLETE, "missing_ranges": missing_ranges}
 
-    contributing = sorted(
-        {
-            fragment["index"]
-            for fragment in parsed
-            if fragment["offset_bytes"] < total_length
-            and clamped_end(fragment) > fragment["offset_bytes"]
-        },
-        key=lambda index: (parsed[index]["offset_bytes"], index),
-    )
+    # 覆盖完整：无冲突时重叠字节处处一致，按 (起点, 输入序号) 顺序逐片用
+    # 切片赋值拼装即可（与原“首个写入分片”逐字节 owner 语义等价）。
+    buffer = bytearray(total_length)
+    for item in items:
+        buffer[item["start"]:item["end"]] = item["slice"]
+    contributing = [item["index"] for item in items]
     return {
         "status": COMPLETE,
         "contributing_fragments": contributing,
-        "payload": base64.b64encode(bytes(buffer)).decode("ascii"),
+        "payload": base64.b64encode(buffer).decode("ascii"),
     }

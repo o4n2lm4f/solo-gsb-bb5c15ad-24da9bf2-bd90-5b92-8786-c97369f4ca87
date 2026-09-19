@@ -272,6 +272,173 @@ def test_conflict_on_clamped_overlap_still_detected():
     assert result == {"status": "conflict", "first_conflict_offset": 10}
 
 
+# ---------- 区间/切片内核回归：首尾嵌套、多片交叉、锚点外数据 ----------
+
+
+def test_head_fragment_nests_last_fragment():
+    # 非末片 [0,24) 完整包含末片 [8,12)：末片锚定总长 12，重叠 [8,12)
+    # 一致即完成；非末片的 [12,24) 落在锚点外被裁剪，不参与比较
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(0, True, b"abcdefgh" + b"ijklXXXX" + b"Y" * 8),
+            frag(1, False, b"ijkl"),
+        ],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [0, 1]
+    assert base64.b64decode(result["payload"]) == b"abcdefghijkl"
+
+
+def test_last_fragment_nests_earlier_fragment_conflict():
+    # 末片 [0,12) 反向包含非末片 [8,16) 的锚点内部分 [8,12)；
+    # 绝对偏移 10 处冲突，无论哪片先输入都返回 10
+    inner = b"ijXm" + b"Z" * 4  # [8,16)：本地 2 => 绝对 10；12～16 在锚点外
+    last = b"abcdefghijkl"  # [0,12)
+    for order in ([frag(1, True, inner), frag(0, False, last)],
+                  [frag(0, False, last), frag(1, True, inner)]):
+        result = reassemble_ipv4(20, order)
+        assert result == {"status": "conflict", "first_conflict_offset": 10}
+
+
+def test_fully_nested_fragment_identical_accepted():
+    # 小片 [8,24) 完全嵌套于大片 [0,32)，重叠字节一致
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(0, True, b"A" * 8 + b"B" * 16 + b"C" * 8),
+            frag(1, True, b"B" * 16),
+            frag(4, False, b""),  # 空末片锚定 32，本身不计贡献
+        ],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [0, 1]
+    assert base64.b64decode(result["payload"]) == (
+        b"A" * 8 + b"B" * 16 + b"C" * 8
+    )
+
+
+def test_fully_nested_fragment_conflict_offset():
+    # 嵌套小片在本地偏移 2（绝对 10）处与大片冲突；小片先输入也须报 10
+    big = b"A" * 8 + b"B" * 16 + b"C" * 8
+    small = b"B" * 2 + b"X" + b"B" * 13
+    for order in ([frag(1, True, small), frag(0, True, big), frag(4, False, b"")],
+                  [frag(0, True, big), frag(1, True, small), frag(4, False, b"")]):
+        assert reassemble_ipv4(20, order) == {
+            "status": "conflict",
+            "first_conflict_offset": 10,
+        }
+
+
+def test_three_way_crossing_overlaps_consistent_complete():
+    # 三片链式交叉：[0,16) / [8,24) / [16,32)，重叠区 [8,16) 与
+    # [16,24) 字节全部一致；乱序输入
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(2, True, b"C" * 8 + b"D" * 8),   # [16,32)
+            frag(0, True, b"A" * 8 + b"B" * 8),   # [0,16)
+            frag(1, True, b"B" * 8 + b"C" * 8),   # [8,24)
+            frag(4, False, b""),                  # 空末片锚定 32
+        ],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [1, 2, 0]
+    assert base64.b64decode(result["payload"]) == (
+        b"A" * 8 + b"B" * 8 + b"C" * 8 + b"D" * 8
+    )
+
+
+def test_three_way_crossing_overlaps_global_min_conflict():
+    # f0[0,16) 与 f1[8,24) 在绝对 9 处冲突；f1 与 f2[16,32) 在绝对 20 处
+    # 冲突；全局最小为 9。对三片的全部 6 种排列都必须返回 9（与输入顺序
+    # 无关），且冲突优先于可能的缺口结论。
+    import itertools
+
+    f0 = (0, True, b"\x00" * 16)
+    f1 = (
+        1,
+        True,
+        b"\x00\x01" + b"\x00" * 6 + b"\x00" * 4 + b"\x02" + b"\x00" * 3,
+    )
+    f2 = (2, True, b"\x00" * 16)
+    anchor = (4, False, b"")
+    for permutation in itertools.permutations((f0, f1, f2)):
+        result = reassemble_ipv4(20, [*permutation, anchor])
+        assert result == {"status": "conflict", "first_conflict_offset": 9}
+
+
+def test_conflict_among_three_equally_covering_fragments():
+    # 三片同起点 [0,8)：owner 为最小输入序号片；另两片各在不同位置与其
+    # 不一致（7 与 3），且二者彼此也不同——必须返回全局最小 3
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(0, True, b"\x00" * 8),
+            frag(0, True, b"\x00" * 7 + b"\x09"),
+            frag(0, True, b"\x00" * 3 + b"\x08" + b"\x00" * 4),
+            frag(1, False, b""),
+        ],
+    )
+    assert result == {"status": "conflict", "first_conflict_offset": 3}
+
+
+def test_conflict_beyond_anchor_ignored_but_inside_reported():
+    # 片 2 覆盖 [8,16)，末片锚定 12：[12,16) 的差异一律忽略，
+    # 但锚点内 [8,12) 的绝对偏移 10 冲突必须报出
+    conflict = reassemble_ipv4(
+        20,
+        [
+            frag(0, True, b"abcdefgh"),
+            frag(1, False, b"ijkl"),
+            frag(1, True, b"ijXmZZZZ"),
+        ],
+    )
+    assert conflict == {"status": "conflict", "first_conflict_offset": 10}
+
+    ok = reassemble_ipv4(
+        20,
+        [
+            frag(0, True, b"abcdefgh"),
+            frag(1, False, b"ijkl"),
+            frag(1, True, b"ijklZZZZ"),  # 差异全部在锚点外
+        ],
+    )
+    assert ok["status"] == "complete"
+    assert ok["contributing_fragments"] == [0, 1, 2]
+    assert base64.b64decode(ok["payload"]) == b"abcdefghijkl"
+
+
+def test_two_fragments_entirely_beyond_anchor_never_compared():
+    # 两片都落在锚点 [0,12) 之外且彼此字节不同：不报冲突、不计贡献
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(0, True, b"abcdefgh"),
+            frag(1, False, b"ijkl"),
+            frag(2, True, b"z" * 8),  # [16,24)
+            frag(3, True, b"y" * 8),  # [24,32)
+        ],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [0, 1]
+    assert base64.b64decode(result["payload"]) == b"abcdefghijkl"
+
+
+def test_beyond_anchor_fragment_does_not_fill_gap():
+    # 末片锚定 24 但 [16,24) 缺口；仅有越界片 [24,40) 不能填补缺口
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(0, True, b"\x00" * 8),
+            frag(1, True, b"\x00" * 8),
+            frag(3, False, b""),        # 空末片锚定 24
+            frag(3, True, b"\x00" * 16),  # [24,40)，完全越界
+        ],
+    )
+    assert result == {"status": "incomplete", "missing_ranges": [[16, 24]]}
+
+
 # ---------- 422 类输入错误 ----------
 
 
